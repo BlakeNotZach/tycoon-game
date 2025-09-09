@@ -1,0 +1,686 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      # Runs a single command using the runners shell
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+      # Runs a set of commands using the runners shell
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
+
+import pygame
+import json
+import os
+from datetime import datetime
+
+# -----------------------------
+# Config & Helpers
+# -----------------------------
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 1280, 720
+FPS = 60
+SAVE_FILE = "savegame.json"
+
+BG_COLOR = (18, 18, 20)
+PANEL_COLOR = (32, 34, 37)
+PANEL_ACCENT = (60, 180, 75)
+TEXT_COLOR = (230, 230, 235)
+DIM_TEXT = (170, 170, 180)
+MONEY_COLOR = (240, 220, 120)
+BTN_COLOR = (52, 56, 61)
+BTN_HOVER = (64, 68, 73)
+TAB_ACTIVE = (80, 140, 230)
+TAB_INACTIVE = (52, 56, 61)
+POPUP_COLOR = (255, 255, 255)
+BORDER = (45, 45, 48)
+
+ICON_CART = "🛒"
+ICON_MENU = "☰"
+
+pygame.init()
+info = pygame.display.Info()
+screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN | pygame.SCALED)
+pygame.display.set_caption("Idle Empire Tycoon")
+clock = pygame.time.Clock()
+
+FONT = pygame.font.SysFont("segoeui", 20)
+FONT_SMALL = pygame.font.SysFont("segoeui", 16)
+FONT_BIG = pygame.font.SysFont("segoeui", 28, bold=True)
+
+def fmt_money(x):
+    if x >= 1e12: return f"${x/1e12:.2f}T"
+    if x >= 1e9:  return f"${x/1e9:.2f}B"
+    if x >= 1e6:  return f"${x/1e6:.2f}M"
+    if x >= 1e3:  return f"${x/1e3:.2f}K"
+    return f"${x:.0f}"
+
+def draw_text(surf, text, font, color, pos, antialias=True, center=False):
+    img = font.render(text, antialias, color)
+    r = img.get_rect()
+    if center: r.center = pos
+    else: r.topleft = pos
+    surf.blit(img, r)
+    return r
+
+# -----------------------------
+# UI Elements
+# -----------------------------
+class Button:
+    def __init__(self, rect, label, on_click):
+        self.rect = pygame.Rect(rect)
+        self.label = label
+        self.on_click = on_click
+        self.hover = False
+    def handle_event(self, e):
+        if e.type == pygame.MOUSEMOTION:
+            self.hover = self.rect.collidepoint(e.pos)
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            if self.rect.collidepoint(e.pos):
+                self.on_click()
+    def draw(self, surf):
+        pygame.draw.rect(surf, BTN_HOVER if self.hover else BTN_COLOR, self.rect, border_radius=10)
+        draw_text(surf, self.label, FONT, TEXT_COLOR, (self.rect.x + 12, self.rect.y + 8))
+
+# -----------------------------
+# Popups (de-overlapped & clipped)
+# -----------------------------
+class PopupManager:
+    def __init__(self): self.popups=[]
+    def add(self, text, x, y, area=None):
+        # Nudge upward if too close to another popup (local de-overlap)
+        y_offsets=[p['y'] for p in self.popups if abs(p['x']-x)<80 and p['life']>0]
+        while any(abs(y-yo)<20 for yo in y_offsets):
+            y -= 20
+        self.popups.append({'text':text,'x':x,'y':y,'vy':-0.35,'life':120,'area':area})
+    def update(self):
+        for p in self.popups:
+            p['y'] += p['vy']; p['life'] -= 1
+        self.popups=[p for p in self.popups if p['life']>0]
+    def draw(self, surf):
+        for p in self.popups:
+            alpha = max(0,min(255,int(255*(p['life']/120))))
+            txt = FONT_SMALL.render(p['text'], True, POPUP_COLOR); txt.set_alpha(alpha)
+            if p.get('area'):
+                prev = surf.get_clip()
+                surf.set_clip(p['area'])
+                surf.blit(txt,(p['x'],p['y']))
+                surf.set_clip(prev)
+            else:
+                surf.blit(txt,(p['x'],p['y']))
+
+# -----------------------------
+# Milestones generator
+# -----------------------------
+def generate_milestones():
+    # Alternating Speed/Revenue boosts up to 2000
+    levels = [10, 25, 50, 100, 250, 500, 1000, 2000]
+    mults  = [1.20,1.25,1.30,1.40,1.50,1.60,1.75,2.00]
+    ms={}
+    for i,lvl in enumerate(levels):
+        if i%2==0:
+            ms[lvl]=(f"Speed +{int((mults[i]-1)*100)}%","speed",mults[i])
+        else:
+            ms[lvl]=(f"Revenue +{int((mults[i]-1)*100)}%","revenue",mults[i])
+    return ms
+
+# -----------------------------
+# Business
+# -----------------------------
+class Business:
+    def __init__(self, name, base_cost, base_rev, cycle_time, cost_mult=1.07, start_level=0, manager_cost_mult=100.0):
+        self.name=name
+        self.level=start_level
+        self.base_cost=base_cost
+        self.base_revenue=base_rev
+        self.cycle_time=cycle_time
+        self.cost_mult=cost_mult
+        self.progress=0.0
+        self.running=False
+        self.unlocked=(start_level>0)
+
+        # Manager
+        self.manager_owned=False
+        self.manager_cost=max(20.0, base_cost*manager_cost_mult)
+
+        # Milestones
+        self.milestones = generate_milestones()
+        self.applied_milestones=set()
+        self.revenue_mult=1.0
+        self.speed_mult=1.0
+
+        # UI rects (screen-space, per-frame)
+        self._panel=None
+        self._buy=None
+        self._mgr=None
+
+    def current_revenue(self):
+        return self.base_revenue * self.level * self.revenue_mult
+
+    def next_cost(self, qty=1):
+        cost=0.0; lvl=self.level
+        for _ in range(qty):
+            cost += self.base_cost*(self.cost_mult**lvl)
+            lvl += 1
+        return cost
+
+    def buy(self, qty, money):
+        unlocked_total=[]
+        if qty=="Max":
+            bought=0
+            while True:
+                c=self.next_cost(1)
+                if money>=c:
+                    money-=c; self.level+=1; self.unlocked=True; bought+=1
+                    unlocked_total += self.check_milestones()
+                else: break
+            return money, bought, unlocked_total
+        qty=int(qty)
+        total=self.next_cost(qty)
+        if money>=total:
+            money-=total; self.level+=qty; self.unlocked=True
+            unlocked_total += self.check_milestones()
+            return money, qty, unlocked_total
+        return money, 0, []
+
+    def check_milestones(self):
+        unlocked=[]
+        for lvl,(desc,kind,mult) in sorted(self.milestones.items()):
+            if self.level>=lvl and lvl not in self.applied_milestones:
+                self.applied_milestones.add(lvl)
+                if kind=="revenue": self.revenue_mult *= mult
+                else: self.speed_mult *= mult
+                unlocked.append((lvl,desc))
+        return unlocked
+
+    def next_milestone_info(self):
+        for lvl in sorted(self.milestones):
+            if self.level < lvl:
+                desc,kind,mult = self.milestones[lvl]
+                return lvl, desc
+        return None, None
+
+    def start(self):
+        if self.level>0 and not self.running:
+            self.running=True; self.progress=0.0
+            return True
+        return False
+
+    def update(self, dt):
+        if self.running and self.level>0:
+            speeded = self.cycle_time / self.speed_mult
+            self.progress += dt
+            if self.progress >= speeded:
+                self.progress = 0.0
+                return True
+        return False
+
+    def ensure_auto(self):
+        if self.manager_owned and self.level>0 and not self.running:
+            self.running=True; self.progress=0.0
+
+    def to_dict(self):
+        return {
+            "name":self.name,"level":self.level,"revenue_mult":self.revenue_mult,"speed_mult":self.speed_mult,
+            "applied_milestones":list(self.applied_milestones),"running":self.running,"progress":self.progress,
+            "unlocked":self.unlocked,"manager_owned":self.manager_owned,"manager_cost":self.manager_cost
+        }
+    def from_dict(self,d):
+        self.level=d.get("level",self.level)
+        self.revenue_mult=d.get("revenue_mult",self.revenue_mult)
+        self.speed_mult=d.get("speed_mult",self.speed_mult)
+        self.applied_milestones=set(d.get("applied_milestones",list(self.applied_milestones)))
+        self.running=d.get("running",False)
+        self.progress=d.get("progress",0.0)
+        self.unlocked=d.get("unlocked",self.unlocked)
+        self.manager_owned=d.get("manager_owned",self.manager_owned)
+        self.manager_cost=d.get("manager_cost",self.manager_cost)
+        self.check_milestones()
+
+# -----------------------------
+# Game
+# -----------------------------
+class Game:
+    def __init__(self):
+        self.money=50.0
+        self.earn_total=0.0
+        self.buy_qty_options=["1","5","10","25","100","Max"]
+        self.buy_idx=0
+        self.current_tab="Businesses"  # Businesses | Managers | Milestones
+        self.milestone_log=[]
+        self.popup_mgr=PopupManager()
+        self.paused=False
+        self.fullscreen=True
+
+        # Scroll per tab
+        self.scroll={"Businesses":0,"Managers":0,"Milestones":0}
+
+        # Businesses
+        self.businesses=[
+            Business("Lemonade Stand", 4,        1,     2.0, 1.07, start_level=1),
+            Business("Newspaper Route", 60,      6,     4.0, 1.07),
+            Business("Car Wash",        720,     36,    6.0, 1.07),
+            Business("Coffee Kiosk",    8640,    216,   8.0, 1.07),
+            Business("Consulting Desk", 103680,  1296, 10.0, 1.07),
+            Business("Office Floor",    1244160, 7776, 12.0, 1.07),
+            Business("Tech Startup",    14929920,46656,15.0, 1.07),
+            Business("Ad Agency",       1.5e8,   2.8e5, 18.0, 1.07),
+            Business("VC Fund",         1.2e9,   1.9e6, 20.0, 1.07),
+            Business("Cloud Platform",  9.6e9,   1.3e7, 22.0, 1.07),
+        ]
+
+        self.layout={}
+        self.recompute_layout()
+
+        # Top buttons
+        self.btn_qty=Button((0,0,0,0), f"Qty: {self.buy_qty_options[self.buy_idx]}", self.cycle_qty)
+        self.tab_business=Button((0,0,0,0), "Businesses", lambda: self.set_tab("Businesses"))
+        self.tab_managers=Button((0,0,0,0), "Managers", lambda: self.set_tab("Managers"))
+        self.tab_milestones=Button((0,0,0,0), "Milestones", lambda: self.set_tab("Milestones"))
+        self.btn_menu=Button((0,0,0,0), ICON_MENU, self.toggle_pause)
+        self.position_topbar_buttons()
+
+        # Pause buttons
+        self.btn_save=Button((0,0,0,0),"Save Game",self.save)
+        self.btn_resume=Button((0,0,0,0),"Resume",self.toggle_pause)
+        self.btn_exit=Button((0,0,0,0),"Exit",self.exit_game)
+        self.position_pause_buttons()
+
+        self.load()
+
+    # ---------- Layout / Scrolling ----------
+    def content_area(self):
+        w,h=screen.get_size()
+        return pygame.Rect(16, 120, w-32, h-136)
+
+    def recompute_layout(self):
+        area=self.content_area()
+        w=area.width
+        cols = 2 if screen.get_size()[0] >= 1400 else 1
+        gap=20                 # more vertical spacing to prevent overlap
+        card_h=136             # taller cards for clearer lines
+        col_w = (w - (cols-1)*gap) // cols
+        rects=[]
+        for i in range(len(self.businesses)):
+            col = i % cols
+            row = i // cols
+            x = area.x + col*(col_w+gap)
+            y = area.y + row*(card_h+gap)
+            rects.append(pygame.Rect(x,y,col_w,card_h))
+        self.layout['biz_rects_content']=rects
+        self.layout['cols']=cols
+        self.layout['card_h']=card_h
+        self.layout['gap']=gap
+        rows = (len(self.businesses)+cols-1)//cols
+        self.layout['biz_content_height']=rows*(card_h+gap)
+
+    def position_topbar_buttons(self):
+        w,h=screen.get_size()
+        y=16
+        self.tab_business.rect=pygame.Rect(16,y,140,36)
+        self.tab_managers.rect=pygame.Rect(168,y,140,36)
+        self.tab_milestones.rect=pygame.Rect(320,y,140,36)
+        self.btn_qty.rect=pygame.Rect(w-170,y,150,36)
+        self.btn_menu.rect=pygame.Rect(w-50,y+48,36,36)
+
+    def position_pause_buttons(self):
+        w,h=screen.get_size(); cx=w//2-100; cy=h//2-30
+        self.btn_save.rect=pygame.Rect(cx,cy-50,200,40)
+        self.btn_resume.rect=pygame.Rect(cx,cy,200,40)
+        self.btn_exit.rect=pygame.Rect(cx,cy+50,200,40)
+
+    def clamp_scroll(self, tab):
+        area=self.content_area()
+        if tab in ("Businesses","Managers"):
+            max_scroll=max(0, self.layout['biz_content_height']-area.height)
+        else:
+            lines=max(0,len(self.milestone_log))
+            content_h = 26*lines + 260  # space for headers + upcoming
+            max_scroll=max(0, content_h - area.height)
+        self.scroll[tab] = max(0, min(self.scroll[tab], max_scroll))
+
+    # ---------- Mode / Pause ----------
+    def set_tab(self,t):
+        self.current_tab=t
+        self.clamp_scroll(t)
+
+    def toggle_pause(self): self.paused=not self.paused
+
+    def toggle_fullscreen(self):
+        global screen
+        self.fullscreen=not self.fullscreen
+        if self.fullscreen:
+            screen = pygame.display.set_mode((0,0), pygame.FULLSCREEN | pygame.SCALED)
+        else:
+            screen = pygame.display.set_mode((DEFAULT_WIDTH,DEFAULT_HEIGHT), pygame.RESIZABLE | pygame.SCALED)
+        self.recompute_layout()
+        self.position_topbar_buttons()
+        self.position_pause_buttons()
+        self.clamp_scroll(self.current_tab)
+
+    def exit_game(self):
+        self.save(); pygame.quit(); raise SystemExit
+
+    def cycle_qty(self):
+        self.buy_idx=(self.buy_idx+1)%len(self.buy_qty_options)
+        self.btn_qty.label=f"Qty: {self.buy_qty_options[self.buy_idx]}"
+
+    # ---------- Economics ----------
+    def buy(self, idx):
+        biz=self.businesses[idx]
+        qty=self.buy_qty_options[self.buy_idx]
+        pre=self.money
+        self.money,bought,unlocked = biz.buy(qty,self.money)
+        if bought>0:
+            spent=pre-self.money
+            for lvl,desc in unlocked:
+                self.milestone_log.append(f"{biz.name} reached L{lvl}: {desc}")
+            # Popup clipped to the business card to avoid overlapping other cards
+            area = biz._panel if biz._panel else self.content_area()
+            anchor_x = (area.right - 160) if biz._panel else area.right - 160
+            anchor_y = (area.top + 12) if biz._panel else area.top + 12
+            self.popup_mgr.add(f"-{fmt_money(spent)}", anchor_x, anchor_y, area=area)
+
+    def buy_manager(self, idx):
+        biz=self.businesses[idx]
+        if biz.manager_owned: return
+        if self.money>=biz.manager_cost:
+            self.money-=biz.manager_cost; biz.manager_owned=True
+            self.popup_mgr.add(f"Hired {biz.name} Manager", 40, 100)
+        else:
+            self.popup_mgr.add("Not enough cash", 40, 100)
+
+    def total_income_rate(self):
+        rate=0.0
+        for b in self.businesses:
+            if b.level>0:
+                cycle=b.cycle_time/b.speed_mult
+                rate += (b.base_revenue*b.level*b.revenue_mult)/cycle
+        return rate
+
+    # ---------- Update ----------
+    def update(self, dt):
+        if self.paused: return
+        for b in self.businesses: b.ensure_auto()
+        for i,b in enumerate(self.businesses):
+            if b.update(dt):
+                earned=b.current_revenue()
+                self.money += earned; self.earn_total += earned
+                area = b._panel if b._panel else self.content_area()
+                self.popup_mgr.add(f"+{fmt_money(earned)}", area.right-120, area.bottom-30, area=area)
+        self.popup_mgr.update()
+
+    # ---------- Draw Topbar ----------
+    def draw_topbar(self, surf):
+        w,h=surf.get_size()
+        # Tabs
+        for btn,name in [(self.tab_business,"Businesses"),(self.tab_managers,"Managers"),(self.tab_milestones,"Milestones")]:
+            pygame.draw.rect(surf, TAB_ACTIVE if self.current_tab==name else TAB_INACTIVE, btn.rect, border_radius=8)
+            draw_text(surf, name, FONT, TEXT_COLOR, (btn.rect.x+10, btn.rect.y+8))
+        # Money & rate
+        draw_text(surf,"Cash:",FONT,DIM_TEXT,(w-480,22))
+        draw_text(surf,fmt_money(self.money),FONT_BIG,MONEY_COLOR,(w-420,16))
+        draw_text(surf,f"$/sec: {fmt_money(self.total_income_rate())}",FONT,DIM_TEXT,(w-420,52))
+        # Buttons
+        self.btn_qty.draw(surf); self.btn_menu.draw(surf)
+        # Divider + hint
+        pygame.draw.line(surf,(55,55,58),(16,112),(w-16,112),1)
+        draw_text(surf,"Mouse wheel to scroll • F11 full-screen • Managers automate production",FONT_SMALL,DIM_TEXT,(24,90))
+
+    # ---------- Draw Businesses (scrollable, clipped, no milestone text) ----------
+    def draw_businesses(self, surf):
+        area=self.content_area()
+        scroll_y=self.scroll["Businesses"]
+
+        # Clip drawing to content area to prevent overlap with tabs/footer
+        prev_clip = surf.get_clip()
+        surf.set_clip(area)
+
+        for b in self.businesses:
+            b._panel = None
+            b._buy = None
+
+        rects = self.layout['biz_rects_content']
+        for i,b in enumerate(self.businesses):
+            base = rects[i]
+            r = pygame.Rect(base.x, base.y - scroll_y, base.width, base.height)
+            if r.bottom < area.top or r.top > area.bottom: 
+                continue
+
+            pygame.draw.rect(surf,PANEL_COLOR,r,border_radius=14)
+            pygame.draw.rect(surf,BORDER,r,width=2,border_radius=14)
+            draw_text(surf,b.name,FONT_BIG,TEXT_COLOR,(r.x+14,r.y+10))
+            draw_text(surf,f"Lvl: {b.level}",FONT,DIM_TEXT,(r.x+14,r.y+42))
+
+            # Progress bar (lower row)
+            bar_h=22
+            bar_w = min(360, r.width-320)
+            bar_x=r.x+240; bar_y=r.y+r.height-bar_h-16
+            pygame.draw.rect(surf,(55,57,60),(bar_x,bar_y,bar_w,bar_h),border_radius=8)
+            pct=(b.progress/(b.cycle_time/b.speed_mult)) if (b.running and b.level>0) else 0.0
+            inner_w=int(bar_w*max(0,min(1,pct)))
+            if inner_w>0: pygame.draw.rect(surf,PANEL_ACCENT,(bar_x,bar_y,inner_w,bar_h),border_radius=8)
+            draw_text(surf,"Progress",FONT_SMALL,DIM_TEXT,(bar_x,bar_y-18))
+
+            # Right column: profit & cost
+            rpc = b.base_revenue*max(1,b.level)*b.revenue_mult
+            draw_text(surf,f"Profit/Cycle: {fmt_money(rpc)}",FONT,TEXT_COLOR,(bar_x+bar_w+16,bar_y-4))
+
+            qty=self.buy_qty_options[self.buy_idx]
+            est_qty=1 if qty=="Max" else int(qty)
+            cost=b.next_cost(est_qty) if qty!="Max" else b.next_cost(1)
+            draw_text(surf,f"Cost ({qty}): {fmt_money(cost) if qty!='Max' else 'auto'}",FONT,TEXT_COLOR,(bar_x+bar_w+16,bar_y+22))
+
+            # Manager status (top right subtle)
+            draw_text(surf, f"{'Manager: ON' if b.manager_owned else 'Manager: OFF'}",
+                      FONT_SMALL, (120,220,140) if b.manager_owned else (220,120,120),
+                      (r.right-160, r.y+12))
+
+            # Buy button (bottom-right, away from progress)
+            buy_rect=pygame.Rect(r.right-140, r.bottom-52, 124, 36)
+            pygame.draw.rect(surf, BTN_COLOR, buy_rect, border_radius=10)
+            draw_text(surf,f"{ICON_CART} Buy",FONT,TEXT_COLOR,(buy_rect.x+16,buy_rect.y+8))
+
+            b._panel = r
+            b._buy = buy_rect
+
+        # Remove clip
+        surf.set_clip(prev_clip)
+
+    # ---------- Draw Managers (scrollable & clipped) ----------
+    def draw_managers_tab(self, surf):
+        area=self.content_area()
+        scroll_y=self.scroll["Managers"]
+
+        prev_clip = surf.get_clip()
+        surf.set_clip(area)
+
+        cols=self.layout['cols']; gap=16; card_h=92
+        w=area.width; col_w=(w-(cols-1)*gap)//cols
+
+        for i,b in enumerate(self.businesses):
+            col=i%cols; row=i//cols
+            r=pygame.Rect(area.x+col*(col_w+gap), area.y + row*(card_h+gap) - scroll_y, col_w, card_h)
+            b._mgr=None
+            if r.bottom<area.top or r.top>area.bottom: continue
+
+            pygame.draw.rect(surf,(40,42,46),r,border_radius=10)
+            pygame.draw.rect(surf,BORDER,r,width=1,border_radius=10)
+            draw_text(surf,b.name,FONT,TEXT_COLOR,(r.x+12,r.y+10))
+            status="Hired" if b.manager_owned else f"Cost: {fmt_money(b.manager_cost)}"
+            draw_text(surf,f"Manager • {status}",FONT,DIM_TEXT,(r.x+12,r.y+36))
+            btn=pygame.Rect(r.right-160, r.y+24, 148, 40)
+            pygame.draw.rect(surf, (35,90,50) if b.manager_owned else BTN_COLOR, btn, border_radius=10)
+            draw_text(surf, "Hired" if b.manager_owned else "Hire Manager", FONT, TEXT_COLOR, (btn.x+14, btn.y+10))
+            b._mgr=btn
+
+        # update scroll clamp
+        rows=(len(self.businesses)+cols-1)//cols
+        content_h=rows*(card_h+gap)
+        max_scroll=max(0, content_h - area.height)
+        self.scroll["Managers"]=max(0,min(self.scroll["Managers"],max_scroll))
+
+        surf.set_clip(prev_clip)
+
+    # ---------- Draw Milestones (all milestone content lives here) ----------
+    def draw_milestones_tab(self, surf):
+        area=self.content_area()
+        scroll_y=self.scroll["Milestones"]
+
+        prev_clip = surf.get_clip()
+        surf.set_clip(area)
+
+        y=area.y - scroll_y
+        draw_text(surf,"Milestones",FONT_BIG,TEXT_COLOR,(area.x, y)); y+=40
+
+        # Unlocked feed (latest first)
+        draw_text(surf,"Unlocked (latest first):",FONT,TEXT_COLOR,(area.x, y)); y+=28
+        if not self.milestone_log:
+            draw_text(surf,"No milestones yet. Keep growing!",FONT,DIM_TEXT,(area.x, y)); y+=28
+        else:
+            for msg in self.milestone_log[::-1]:
+                if y>area.bottom: break
+                if y+24>=area.top:
+                    draw_text(surf,f"• {msg}",FONT,TEXT_COLOR,(area.x, y))
+                y+=24
+
+        # Upcoming by business
+        y += 20
+        draw_text(surf,"Upcoming by Business:",FONT,TEXT_COLOR,(area.x, y)); y+=28
+        for b in self.businesses:
+            if y>area.bottom: break
+            nxt_lvl, nxt_desc = b.next_milestone_info()
+            line = f"{b.name}: " + (f"L{nxt_lvl} → {nxt_desc}" if nxt_lvl else "All milestones reached")
+            draw_text(surf, line, FONT, DIM_TEXT, (area.x, y)); y+=24
+
+        # update scroll clamp rough
+        total_height = y - (area.y - scroll_y)
+        max_scroll=max(0, total_height - (area.height))
+        self.scroll["Milestones"]=max(0,min(self.scroll["Milestones"],max_scroll))
+
+        surf.set_clip(prev_clip)
+
+    # ---------- Events ----------
+    def handle_event(self, e):
+        # top controls always active
+        self.tab_business.handle_event(e); self.tab_managers.handle_event(e); self.tab_milestones.handle_event(e)
+        self.btn_qty.handle_event(e); self.btn_menu.handle_event(e)
+
+        if e.type==pygame.KEYDOWN:
+            if e.key==pygame.K_ESCAPE: self.toggle_pause()
+            elif e.key==pygame.K_F11: self.toggle_fullscreen()
+            elif e.key==pygame.K_PAGEUP:  self.scroll[self.current_tab]=max(0,self.scroll[self.current_tab]-300)
+            elif e.key==pygame.K_PAGEDOWN: self.scroll[self.current_tab]+=300; self.clamp_scroll(self.current_tab)
+            elif e.key==pygame.K_HOME: self.scroll[self.current_tab]=0
+            elif e.key==pygame.K_END:  self.scroll[self.current_tab]=10**9; self.clamp_scroll(self.current_tab)
+
+        if e.type==pygame.MOUSEWHEEL:
+            self.scroll[self.current_tab] -= e.y*70
+            self.clamp_scroll(self.current_tab)
+
+        if e.type==pygame.VIDEORESIZE:
+            self.recompute_layout(); self.position_topbar_buttons(); self.position_pause_buttons(); self.clamp_scroll(self.current_tab)
+
+        if self.paused:
+            self.btn_save.handle_event(e); self.btn_resume.handle_event(e); self.btn_exit.handle_event(e)
+            return
+
+        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
+            if self.current_tab=="Businesses":
+                for i,b in enumerate(self.businesses):
+                    if b._buy and b._buy.collidepoint(e.pos): 
+                        self.buy(i)
+                    elif b._panel and b._panel.collidepoint(e.pos):
+                        if not (b._buy and b._buy.collidepoint(e.pos)):
+                            if b.start():
+                                # popup clipped to card
+                                self.popup_mgr.add("▶ Running...", b._panel.x+10, b._panel.y+10, area=b._panel)
+            elif self.current_tab=="Managers":
+                for i,b in enumerate(self.businesses):
+                    if b._mgr and b._mgr.collidepoint(e.pos):
+                        self.buy_manager(i)
+
+    # ---------- Save / Load ----------
+    def save(self):
+        data={
+            "money":self.money,"earn_total":self.earn_total,"buy_idx":self.buy_idx,
+            "milestone_log":self.milestone_log,"businesses":[b.to_dict() for b in self.businesses],
+            "timestamp":datetime.utcnow().isoformat()+"Z"
+        }
+        try:
+            with open(SAVE_FILE,"w",encoding="utf-8") as f: json.dump(data,f,indent=2)
+            self.popup_mgr.add("Game Saved",40,80)
+        except Exception as ex:
+            self.popup_mgr.add(f"Save failed: {ex}",40,80)
+
+    def load(self):
+        if not os.path.exists(SAVE_FILE): return
+        try:
+            with open(SAVE_FILE,"r",encoding="utf-8") as f: data=json.load(f)
+            self.money=data.get("money",self.money)
+            self.earn_total=data.get("earn_total",self.earn_total)
+            self.buy_idx=data.get("buy_idx",self.buy_idx)
+            self.btn_qty.label=f"Qty: {self.buy_qty_options[self.buy_idx]}"
+            self.milestone_log=data.get("milestone_log",[])
+            saved_biz=data.get("businesses",[])
+            for b,d in zip(self.businesses,saved_biz): b.from_dict(d)
+        except Exception as ex:
+            self.popup_mgr.add(f"Load failed: {ex}",40,80)
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    game=Game(); running=True
+    while running:
+        dt=clock.tick(FPS)/1000.0
+        for e in pygame.event.get():
+            if e.type==pygame.QUIT:
+                game.save(); running=False
+            else:
+                game.handle_event(e)
+        game.update(dt)
+
+        screen.fill(BG_COLOR)
+        game.draw_topbar(screen)
+        if game.current_tab=="Businesses": game.draw_businesses(screen)
+        elif game.current_tab=="Managers": game.draw_managers_tab(screen)
+        else: game.draw_milestones_tab(screen)
+
+        game.popup_mgr.draw(screen)
+
+        if game.paused:
+            overlay=pygame.Surface(screen.get_size(),pygame.SRCALPHA); overlay.fill((10,10,12,200)); screen.blit(overlay,(0,0))
+            draw_text(screen,"Paused",FONT_BIG,TEXT_COLOR,(screen.get_width()//2,screen.get_height()//2-110),center=True)
+            game.btn_save.draw(screen); game.btn_resume.draw(screen); game.btn_exit.draw(screen)
+
+        pygame.display.flip()
+    pygame.quit()
+
+if __name__=="__main__":
+    main()
